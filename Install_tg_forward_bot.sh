@@ -1,287 +1,391 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# =========================================
-# Telegram Forward Bot Installer (Ubuntu/Debian)
-# Subcommands:
-#   install       -> نصب کامل + سوال پرسیدن (Token/IDs/Mode) + ساخت سرویس
-#   reconfigure   -> فقط ویرایش مقادیر .env با پرسش تعاملی + ری‌استارت سرویس
-#   uninstall     -> حذف کامل
-#   status        -> وضعیت سرویس
-#   logs          -> نمایش لاگ
-# =========================================
-
-NAME="tg-forward-bot"
-INSTALL_DIR_BASE="/opt"
-PYTHON_VERSION_BIN="python3"
-SERVICE_USER="root"
-
-SUBCMD=""
-if [[ "${1:-}" == "@" ]]; then shift; fi
-SUBCMD="${1:-}"; shift || true
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --name) NAME="${2:-}"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-
-INSTALL_DIR="$INSTALL_DIR_BASE/$NAME"
-VENV_DIR="$INSTALL_DIR/.venv"
-SERVICE_FILE="/etc/systemd/system/${NAME}.service"
-ENV_FILE="$INSTALL_DIR/.env"
-BOT_FILE="$INSTALL_DIR/bot.py"
-REQ_FILE="$INSTALL_DIR/requirements.txt"
-
-ensure_root() { if [[ $EUID -ne 0 ]]; then echo "❌ لطفاً با sudo اجرا کنید."; exit 1; fi; }
-
-detect_os() {
-  if [[ -f /etc/debian_version || -f /etc/lsb-release ]]; then echo "debianlike"; else echo "unknown"; fi
-}
-
-prompt_nonempty() {
-  local label="$1" var
-  while true; do
-    read -r -p "$label" var || true
-    var="$(echo -n "$var" | sed 's/[[:space:]]*$//')"
-    if [[ -n "$var" ]]; then echo "$var"; return 0; fi
-    echo "⚠️ مقدار نمی‌تواند خالی باشد."
-  done
-}
-
-prompt_token() {
-  local t
-  while true; do
-    t="$(prompt_nonempty '🔑 BOT Token (از BotFather): ')"
-    if [[ "$t" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then echo "$t"; return 0; fi
-    echo "⚠️ فرمت توکن درست نیست. نمونه: 123456789:ABCdefGh_..."
-  done
-}
-
-prompt_int() {
-  local label="$1" v
-  while true; do
-    v="$(prompt_nonempty "$label")"
-    if [[ "$v" =~ ^-?[0-9]+$ ]]; then echo "$v"; return 0; fi
-    echo "⚠️ فقط عدد وارد کنید (Channel ID معمولا با -100 شروع می‌شود)."
-  done
-}
-
-prompt_mode() {
-  local m
-  while true; do
-    read -r -p "↪️ حالت ارسال (forward/copy) [forward]: " m || true
-    m="${m,,}"
-    [[ -z "$m" ]] && m="forward"
-    if [[ "$m" == "forward" || "$m" == "copy" ]]; then echo "$m"; return 0; fi
-    echo "⚠️ فقط forward یا copy"
-  done
-}
-
-install_deps() {
-  echo "📦 نصب پیش‌نیازها..."
-  apt-get update -y
-  apt-get install -y $PYTHON_VERSION_BIN python3-venv python3-pip curl
-}
-
-create_layout() {
-  echo "📁 ساخت مسیر $INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
-}
-
-write_bot_py() {
-  cat > "$BOT_FILE" <<'PY'
 # -*- coding: utf-8 -*-
-# Telegram Forward Bot (python-telegram-bot v20.x)
-import os
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
+"""
+Telegram Forward Bot – full features (PTB v20.7)
 
-# خواندن تنظیمات از Environment (که systemd از .env لود می‌کند)
+Features:
+- /start: راهنما + دعوت به ارسال پیام خوش‌آمد
+- فوروارد/کپی همه پیام‌ها به ادمین و چنل، با inline keyboard زیر پیام چنل:
+    [🚫 بلاک/✅ انبلاک] [✉️ پاسخ]
+- بلاک/انبلاک: جلوگیری کامل از استفاده کاربر
+- پاسخ: ادمین با زدن «✉️ پاسخ» از همان‌جا پیام می‌نویسد و برای کاربر ارسال می‌شود
+- /همدردی: ارسال ناشناس کاربر به ادمین
+- /بازی یا /game: بازی بسکتبال نوبتی تا امتیاز 3 بین کاربر و ادمین
+"""
+
+import os
+import random
+from typing import Dict, Any
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
+
+# ---------- Config from environment ----------
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0") or "0")
 FORWARD_MODE = os.getenv("FORWARD_MODE", "forward").strip().lower()
 
-def _ensure_env():
-    missing = []
-    if not TOKEN: missing.append("BOT_TOKEN")
-    if not ADMIN_ID: missing.append("ADMIN_ID")
-    if not CHANNEL_ID: missing.append("CHANNEL_ID")
-    if FORWARD_MODE not in ("forward", "copy"): missing.append("FORWARD_MODE (forward/copy)")
-    if missing:
-        raise SystemExit("❌ تنظیمات ناقص است: " + ", ".join(missing))
+if not TOKEN or not ADMIN_ID or not CHANNEL_ID or FORWARD_MODE not in ("forward", "copy"):
+    raise SystemExit("❌ تنظیمات ناقص است. BOT_TOKEN / ADMIN_ID / CHANNEL_ID / FORWARD_MODE را در .env پر کنید.")
 
-def _as_int(x: str) -> int:
-    try: return int(x)
-    except Exception: raise SystemExit(f"❌ مقدار باید عددی باشد: {x}")
+# ---------- In-memory state (می‌شود با persistence هم عوض کرد) ----------
+blocked_users: set[int] = set()
+pending_reply_for_admin: Dict[int, int] = {}  # admin_id -> target_user_id (فقط برای ADMIN_ID استفاده می‌شود)
+games: Dict[int, Dict[str, Any]] = {}  # key: user_id; value: state dict
 
+# ---------- Helpers ----------
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+def channel_buttons(user_id: int) -> InlineKeyboardMarkup:
+    """دکمه‌های زیر پیام چنل؛ بسته به وضعیت بلاک/انبلاک تغییر می‌کند."""
+    blocked = user_id in blocked_users
+    toggle = InlineKeyboardButton("✅ انبلاک" if blocked else "🚫 بلاک",
+                                  callback_data=f"toggleblock:{user_id}")
+    reply = InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply:{user_id}")
+    return InlineKeyboardMarkup([[toggle, reply]])
+
+def start_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("/همدردی"), KeyboardButton("/بازی")]],
+        resize_keyboard=True
+    )
+
+async def safe_reply(msg, text):
+    try:
+        await msg.reply_text(text)
+    except Exception:
+        pass
+
+# ---------- Command: /start ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام! 👋\n"
-        "لطفاً پیام خوش‌آمد یا درخواست‌تان را ارسال کنید تا برای ادمین/چنل فوروارد شود. ✅"
+        "برای شروع، لطفاً پیام خوش‌آمد یا درخواست‌تان را بفرستید تا برای ادمین ارسال کنم. ✅\n\n"
+        "دستورات:\n"
+        "• /همدردی → ارسال ناشناس به ادمین\n"
+        "• /بازی → درخواست بازی بسکتبال با ادمین (تا ۳ امتیاز)\n",
+        reply_markup=start_menu()
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "این بات هر پیام شما را برای ادمین و چنل تعیین‌شده ارسال می‌کند.\n"
-        "حالت ارسال: forward/copy (در .env قابل تغییر است)."
-    )
+# ---------- Command: /همدردی ----------
+async def empathy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and user.id in blocked_users:
+        return await update.message.reply_text("⛔️ دسترسی شما مسدود است.")
+    # انتظار داریم پیام بعدی کاربر متن همدردی باشد
+    context.user_data["awaiting_empathy"] = True
+    await update.message.reply_text("لطفاً پیام همدردی‌ات را بفرست؛ ناشناس برای ادمین ارسال می‌شود.")
 
+async def handle_empathy_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.pop("awaiting_empathy", False):
+        return False
+    txt = update.effective_message.text or "(بدون متن)"
+    # برای ناشناس بودن، copy می‌کنیم و هویّت را لو نمی‌دهیم
+    prefix = "💌 همدردی ناشناس جدید:\n—\n"
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=prefix + txt)
+        await update.message.reply_text("✅ ارسال شد (به صورت ناشناس).")
+    except Exception:
+        await update.message.reply_text("❌ ارسال نشد. کمی بعد دوباره امتحان کن.")
+    return True
+
+# ---------- Forward/copy all messages to admin & channel with buttons ----------
 async def forward_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    user = update.effective_user
+
     if not msg or (msg.text and msg.text.startswith("/")):
         return
 
-    admin_id = _as_int(ADMIN_ID)
-    channel_id = _as_int(CHANNEL_ID)
-    targets = [admin_id] if admin_id == channel_id else [admin_id, channel_id]
+    if user and user.id in blocked_users:
+        return await safe_reply(msg, "⛔️ شما مسدود هستید.")
 
-    ok = False
-    for dest in targets:
-        try:
-            if FORWARD_MODE == "copy":
-                await msg.copy(chat_id=dest)
-            else:
-                await msg.forward(chat_id=dest)
-            ok = True
-        except Exception as e:
-            print(f"⚠️ ارسال به {dest} خطا داد: {e}")
+    # مقصدها: ادمین + چنل
+    destinations = [ADMIN_ID] if ADMIN_ID == CHANNEL_ID else [ADMIN_ID, CHANNEL_ID]
 
-    if ok:
-        await msg.reply_text("✅ ارسال شد؛ پیام شما به دست ادمین/چنل رسید.")
+    # به ادمین بدون دکمه
+    try:
+        if FORWARD_MODE == "copy":
+            await msg.copy(chat_id=ADMIN_ID, caption=(msg.caption or None))
+        else:
+            await msg.forward(chat_id=ADMIN_ID)
+    except Exception as e:
+        print("forward to admin error:", e)
+
+    # به چنل همراه با دکمه‌های مدیریت
+    try:
+        if FORWARD_MODE == "copy":
+            sent = await msg.copy(chat_id=CHANNEL_ID, reply_markup=channel_buttons(user.id))
+        else:
+            sent = await msg.forward(chat_id=CHANNEL_ID)
+            # پیام فورواردشده را نمی‌توان ویرایش کرد؛ یک پیام کناری می‌فرستیم با دکمه‌ها
+            await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=f"پیام از کاربر #{user.id}",
+                reply_markup=channel_buttons(user.id),
+                reply_to_message_id=sent.message_id
+            )
+    except Exception as e:
+        print("forward to channel error:", e)
+
+    # تأیید برای کاربر
+    await safe_reply(msg, "✅ ارسال شد؛ پیام شما به دست ادمین/چنل رسید.")
+
+# ---------- Inline button handlers: block / unblock / reply ----------
+async def on_toggleblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(update.effective_user.id):
+        return await cq.edit_message_text("⛔️ فقط ادمین می‌تواند بلاک/انبلاک کند.")
+    try:
+        user_id = int(cq.data.split(":")[1])
+    except Exception:
+        return
+    if user_id in blocked_users:
+        blocked_users.remove(user_id)
+        text = f"✅ کاربر {user_id} انبلاک شد."
     else:
-        await msg.reply_text("❌ نشد ارسال کنم. لطفاً بعداً دوباره تلاش کنید.")
+        blocked_users.add(user_id)
+        text = f"🚫 کاربر {user_id} بلاک شد."
+    # آپدیت دکمه‌ها
+    try:
+        await cq.edit_message_reply_markup(reply_markup=channel_buttons(user_id))
+    except Exception:
+        pass
+    await cq.message.reply_text(text)
 
+async def on_reply_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(update.effective_user.id):
+        return await cq.edit_message_text("⛔️ فقط ادمین می‌تواند پاسخ بدهد.")
+    try:
+        user_id = int(cq.data.split(":")[1])
+    except Exception:
+        return
+    pending_reply_for_admin[ADMIN_ID] = user_id
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"✉️ پاسخ به کاربر {user_id} را بنویس و ارسال کن… (اولین پیام بعدی‌ات برای او ارسال می‌شود)"
+    )
+
+async def on_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اگر ادمین پیامی بده و در حالت پاسخ باشد، به کاربر مقصد ارسال کن."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    target = pending_reply_for_admin.pop(ADMIN_ID, None)
+    if not target:
+        return  # پیام آزاد ادمین؛ کاری نکن
+    if target in blocked_users:
+        return await update.message.reply_text("⛔️ این کاربر بلاک است.")
+    try:
+        # پیام ادمین را برای کاربر ارسال کن
+        if update.message.text or update.message.caption:
+            txt = update.message.text or update.message.caption
+            await context.bot.send_message(chat_id=target, text=f"📩 پیام از ادمین:\n\n{txt}")
+        elif update.message.effective_attachment:
+            # برای مدیاها: فوروارد/کپی ساده
+            await update.message.copy(chat_id=target)
+        await update.message.reply_text("✅ برای کاربر ارسال شد.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ ارسال نشد: {e}")
+
+# ---------- Basketball game ----------
+def game_state_template(user_id: int) -> Dict[str, Any]:
+    return {
+        "user": user_id,
+        "scores": {"user": 0, "admin": 0},
+        "turn": "user",  # user یا admin
+        "active": True,
+    }
+
+def game_keyboard(user_turn: bool) -> InlineKeyboardMarkup:
+    label = "🏀 شوت 🎯"
+    btn = InlineKeyboardButton(label, callback_data="shot")
+    info = InlineKeyboardButton("ℹ️ وضعیت", callback_data="noop")
+    # فقط کسی که نوبتش است باید بتواند شوت بزند؛
+    # کنترل در سمت هندلر انجام می‌شود (با چک کردن شناسه کلیک‌کننده)
+    return InlineKeyboardMarkup([[btn, info]])
+
+def score_text(state: Dict[str, Any]) -> str:
+    u = state["scores"]["user"]
+    a = state["scores"]["admin"]
+    turn = "نوبت شماست" if state["turn"] == "user" else "نوبت ادمین است"
+    return f"نتیجه: شما {u}  -  ادمین {a}\n{turn}\n(اولین نفر تا ۳ امتیاز برنده می‌شود)"
+
+async def game_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کاربر /بازی می‌زند: از ادمین تایید می‌گیرند."""
+    user = update.effective_user
+    if user.id in blocked_users:
+        return await update.message.reply_text("⛔️ شما مسدود هستید.")
+    # اگر بازی قبلی کاربر هنوز فعال است
+    if games.get(user.id, {}).get("active"):
+        return await update.message.reply_text("⚠️ بازی قبلی شما هنوز تمام نشده است.")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ قبول", callback_data=f"acceptgame:{user.id}"),
+         InlineKeyboardButton("❌ رد", callback_data=f"declinegame:{user.id}")]
+    ])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"🎮 درخواست بازی بسکتبال از کاربر {user.id}.\nقبول می‌کنی؟",
+        reply_markup=kb
+    )
+    await update.message.reply_text("درخواست بازی برای ادمین ارسال شد. منتظر تایید بمان…")
+
+async def on_game_accept_or_decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(update.effective_user.id):
+        return await cq.edit_message_text("⛔️ فقط ادمین می‌تواند تایید کند.")
+    data = cq.data
+    action, user_id_s = data.split(":")
+    user_id = int(user_id_s)
+
+    if action == "declinegame":
+        await cq.edit_message_text(f"❌ بازی با کاربر {user_id} رد شد.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="متاسفانه ادمین بازی را رد کرد.")
+        except Exception:
+            pass
+        return
+
+    # accept
+    state = game_state_template(user_id)
+    games[user_id] = state
+    await cq.edit_message_text(f"✅ بازی با {user_id} شروع شد!\n" + score_text(state))
+
+    # پیام شروع برای کاربر
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🏀 بازی شروع شد! شما شروع‌کننده‌اید.\n" + score_text(state),
+            reply_markup=game_keyboard(user_turn=True)
+        )
+    except Exception:
+        pass
+    # پیام راهنما برای ادمین
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="بازی شروع شد. نوبتِ کاربر است. منتظر بمانید…",
+        reply_markup=game_keyboard(user_turn=False)
+    )
+
+async def on_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    player_id = update.effective_user.id
+    await cq.answer()
+
+    # تشخیص اینکه این کلیک مربوط به کدام بازی است
+    # بازی‌ها به ازای user_id ذخیره شده‌اند؛ اگر ادمین بزند، باید بازی‌ای پیدا کنیم که turn=admin است
+    target_user_id = None
+    for uid, st in games.items():
+        if st.get("active"):
+            if player_id == ADMIN_ID and st["turn"] == "admin":
+                target_user_id = uid
+                break
+            if player_id == uid and st["turn"] == "user":
+                target_user_id = uid
+                break
+    if target_user_id is None:
+        return  # کلیک بی‌اعتبار یا نوبت شما نیست
+
+    state = games[target_user_id]
+    shooter = "admin" if player_id == ADMIN_ID else "user"
+
+    # شلیک
+    goal = random.random() < 0.5  # 50% موفقیت
+    if goal:
+        state["scores"][shooter] += 1
+        result = "✅ گل شد!"
+    else:
+        result = "❌ از دست رفت."
+
+    # بررسی پایان بازی
+    if state["scores"][shooter] >= 3:
+        state["active"] = False
+        winner_txt = "ادمین" if shooter == "admin" else "شما"
+        # اطلاع به هر دو
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"{result}\n\n🏁 بازی تمام شد! **{winner_txt}** برنده شد.\n" + score_text(state)
+            )
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"{result}\n\n🏁 بازی تمام شد! {winner_txt} برنده شد.\n" + score_text(state)
+            )
+        except Exception:
+            pass
+        return
+
+    # نوبت عوض شود
+    state["turn"] = "admin" if shooter == "user" else "user"
+
+    # به‌روزرسانی پیام‌ها برای هر طرف
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"{result}\n" + score_text(state),
+            reply_markup=game_keyboard(user_turn=(state["turn"] == "user"))
+        )
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"{result}\n" + score_text(state),
+            reply_markup=game_keyboard(user_turn=(state["turn"] == "admin"))
+        )
+    except Exception:
+        pass
+
+# ---------- Help ----------
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "دستورات:\n"
+        "/start — شروع\n"
+        "/همدردی — ارسال ناشناس به ادمین\n"
+        "/بازی یا /game — بازی بسکتبال با ادمین\n"
+    )
+
+# ---------- Main ----------
 def main():
-    _ensure_env()
     app = Application.builder().token(TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler(["بازی", "game"], game_request))
+    app.add_handler(CommandHandler("همدردی", empathy_cmd))
+
+    # Admin reply message (when pending)
+    app.add_handler(MessageHandler(filters.USER(user_id=ADMIN_ID) & ~filters.COMMAND, on_admin_message))
+
+    # Empathy free-text handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_empathy_text))
+
+    # Forward all (non-commands), but AFTER empathy handler so آن پیام مصرف نشود
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, forward_all))
+
+    # Callback buttons
+    app.add_handler(CallbackQueryHandler(on_toggleblock, pattern=r"^toggleblock:\-?\d+$"))
+    app.add_handler(CallbackQueryHandler(on_reply_request, pattern=r"^reply:\-?\d+$"))
+    app.add_handler(CallbackQueryHandler(on_game_accept_or_decline, pattern=r"^(acceptgame|declinegame):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_shot, pattern=r"^shot$"))
+    app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern=r"^noop$"))
+
     print("✅ Bot is running (Ctrl+C to stop).")
-    app.run_polling()  # بلاکینگ و بدون درگیری با asyncio.run
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
-PY
-}
-
-write_requirements() {
-  cat > "$REQ_FILE" <<'REQ'
-python-telegram-bot==20.7
-REQ
-}
-
-create_venv_and_install() {
-  echo "🐍 ساخت venv و نصب وابستگی‌ها..."
-  $PYTHON_VERSION_BIN -m venv "$VENV_DIR"
-  # shellcheck disable=SC1091
-  source "$VENV_DIR/bin/activate"
-  pip install --upgrade pip
-  pip install -r "$REQ_FILE"
-}
-
-prompt_and_write_env() {
-  echo
-  echo "📝 لطفاً تنظیمات را وارد کنید:"
-  local token admin channel mode
-  token="$(prompt_token)"
-  admin="$(prompt_int '👤 ADMIN_ID (آیدی عددی ادمین): ')"
-  channel="$(prompt_int '📣 CHANNEL_ID (معمولاً -100...): ')"
-  mode="$(prompt_mode)"
-
-  cat > "$ENV_FILE" <<ENV
-BOT_TOKEN=$token
-ADMIN_ID=$admin
-CHANNEL_ID=$channel
-FORWARD_MODE=$mode
-ENV
-  echo "✔️ تنظیمات در $ENV_FILE ذخیره شد."
-}
-
-write_service() {
-  echo "🧩 ساخت سرویس systemd: $SERVICE_FILE"
-  cat > "$SERVICE_FILE" <<SERVICE
-[Unit]
-Description=Telegram Forward Bot ($NAME)
-After=network.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$INSTALL_DIR
-EnvironmentFile=$ENV_FILE
-ExecStart=$VENV_DIR/bin/python $BOT_FILE
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:$INSTALL_DIR/bot.log
-StandardError=append:$INSTALL_DIR/bot.err
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-  systemctl daemon-reload
-  systemctl enable "$NAME"
-}
-
-start_service() {
-  systemctl restart "$NAME"
-  systemctl status "$NAME" --no-pager -l || true
-  echo
-  echo "🎉 سرویس '$NAME' اجرا شد."
-  echo "📄 مسیر نصب: $INSTALL_DIR"
-  echo "📝 لاگ‌ها: $INSTALL_DIR/bot.log  و  $INSTALL_DIR/bot.err"
-}
-
-cmd_install() {
-  ensure_root
-  [[ "$(detect_os)" == "debianlike" ]] || echo "⚠️ روی Debian/Ubuntu تست شده."
-  install_deps
-  create_layout
-  write_bot_py
-  write_requirements
-  create_venv_and_install
-  prompt_and_write_env
-  write_service
-  start_service
-}
-
-cmd_reconfigure() {
-  ensure_root
-  if [[ ! -d "$INSTALL_DIR" ]]; then echo "❌ نصب پیدا نشد در $INSTALL_DIR"; exit 1; fi
-  prompt_and_write_env
-  systemctl restart "$NAME"
-  systemctl status "$NAME" --no-pager -l || true
-}
-
-cmd_uninstall() {
-  ensure_root
-  systemctl stop "$NAME" || true
-  systemctl disable "$NAME" || true
-  rm -f "$SERVICE_FILE"
-  systemctl daemon-reload
-  rm -rf "$INSTALL_DIR"
-  echo "✔️ حذف شد."
-}
-
-cmd_status()  { ensure_root; systemctl status "$NAME" --no-pager -l || true; }
-cmd_logs()    { ensure_root; journalctl -u "$NAME" -e --no-pager || true; }
-
-case "$SUBCMD" in
-  install)     cmd_install ;;
-  reconfigure) cmd_reconfigure ;;
-  uninstall)   cmd_uninstall ;;
-  status)      cmd_status ;;
-  logs)        cmd_logs ;;
-  *)
-    cat <<USAGE
-Usage:
-  $0 @ install [--name NAME]      # نصب کامل + سوال پرسیدن و تنظیم .env
-  $0 @ reconfigure [--name NAME]   # ویرایش تعاملی .env و ری‌استارت
-  $0 @ status [--name NAME]
-  $0 @ logs [--name NAME]
-  $0 @ uninstall [--name NAME]
-USAGE
-    ;;
-esac
